@@ -25,8 +25,15 @@ Use the provided Python launch file to start the node. You can dynamically pass 
 ```bash
 ros2 launch flir_boson_usb2 flir_boson.launch.py \
     dev:=/dev/video0 \
-    video_mode:=YUV
+    video_mode:=YUV \
+    frame_rate:=30.0
 ```
+Notes on Frame Rate and Performance:
+
+* Hardware Overrides: The frame_rate argument controls the ROS 2 software polling timer, not the physical camera hardware. If your specific FLIR Boson is factory-locked to ~9 Hz (due to export restrictions) or 60 Hz, the camera will stream at that fixed hardware rate regardless of this parameter.
+
+* video_mode:=RAW16 requires significant host CPU overhead due to the sequential execution of software-based image filters. On multi-camera setups or resource-constrained environments, RAW16 processing times or USB bandwidth limits may throttle the publishing frequency down. For maximum performance and lower CPU utilization, use video_mode:=YUV.
+
 ### Launch Arguments
 | Argument | Description | Default |
 | :--- | :--- | :--- |
