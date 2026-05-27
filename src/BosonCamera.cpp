@@ -93,31 +93,35 @@ BosonCamera::~BosonCamera()
   closeCamera();
 }
 
-void BosonCamera::agcBasicLinear(const Mat& input_16, Mat* output_8, const int& height, const int& width)
+void BosonCamera::agcBasicLinear(const cv::Mat& input_16, cv::Mat* output_8, const int& height, const int& width)
 {
-  unsigned int max1 = 0;
-  unsigned int min1 = 0xFFFF;
-  unsigned int value1, value2, value3, value4;
+    uint16_t min1 = 0xFFFF;
+    uint16_t max1 = 0x0000;
 
-  for (int i = 0; i < height; i++) {
-    for (int j = 0; j < width; j++) {
-      value1 = input_16.at<uchar>(i, j * 2 + 1) & 0xFF;
-      value2 = input_16.at<uchar>(i, j * 2) & 0xFF;
-      value3 = (value1 << 8) + value2;
-      if (value3 <= min1) min1 = value3;
-      if (value3 >= max1) max1 = value3;
+    for (int i = 0; i < height; i++) {
+        const uint16_t* row = input_16.ptr<uint16_t>(i);
+        for (int j = 0; j < width; j++) {
+            uint16_t v = row[j];
+            if (v < min1) min1 = v;
+            if (v > max1) max1 = v;
+        }
     }
-  }
 
-  for (int i = 0; i < height; i++) {
-    for (int j = 0; j < width; j++) {
-      value1 = input_16.at<uchar>(i, j * 2 + 1) & 0xFF;
-      value2 = input_16.at<uchar>(i, j * 2) & 0xFF;
-      value3 = (value1 << 8) + value2;
-      value4 = (max1 - min1) == 0 ? 0 : ((255 * (value3 - min1))) / (max1 - min1);
-      output_8->at<uchar>(i, j) = static_cast<uint8_t>(value4 & 0xFF);
+    if (max1 <= min1) {
+        output_8->setTo(0);
+        return;
     }
-  }
+
+    for (int i = 0; i < height; i++) {
+        const uint16_t* in_row = input_16.ptr<uint16_t>(i);
+        uint8_t* out_row = output_8->ptr<uint8_t>(i);
+
+        for (int j = 0; j < width; j++) {
+            uint16_t v = in_row[j];
+            uint32_t scaled = (255u * (v - min1)) / (max1 - min1);
+            out_row[j] = static_cast<uint8_t>(scaled);
+        }
+    }
 }
 
 bool BosonCamera::openCamera()
@@ -151,6 +155,27 @@ bool BosonCamera::openCamera()
 
   if (ioctl(fd_, VIDIOC_S_FMT, &format) < 0) {
     RCLCPP_ERROR(this->get_logger(), "VIDIOC_S_FMT error. Format not supported.");
+    return false;
+  }
+  
+  // --- ADD THIS: TELEMETRY FIX ---
+  // Overwrite hardcoded dimensions with the ACTUAL hardware dimensions.
+  // If telemetry is ON, format.fmt.pix.height will be larger (e.g. 516).
+  width_ = format.fmt.pix.width;
+  height_ = format.fmt.pix.height;
+  // -------------------------------
+
+  // checking if the negotiated format matches the one requested.
+  if (video_mode_ == RAW16 && format.fmt.pix.pixelformat != V4L2_PIX_FMT_Y16) {
+    RCLCPP_ERROR(this->get_logger(), "Driver did not negotiate Y16 in RAW16 mode.");
+    return false;
+  }
+
+  bool is_i420 = (format.fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420);
+  bool is_yv12 = (format.fmt.pix.pixelformat == V4L2_PIX_FMT_YVU420);
+
+  if (video_mode_ == YUV && !is_i420 && !is_yv12) {
+    RCLCPP_ERROR(this->get_logger(), "Driver did not negotiate a supported 8-bit 4:2:0 format.");
     return false;
   }
 
@@ -190,7 +215,7 @@ bool BosonCamera::openCamera()
   }
 
   if (video_mode_ == RAW16) {
-    thermal16_ = Mat(height_, width_, CV_16U, buffer_start_);
+    thermal16_ = Mat(height_, width_, CV_16UC1, buffer_start_, format.fmt.pix.bytesperline);
     thermal16_linear_ = Mat(height_, width_, CV_8U, 1);
   } else {
     int luma_height = height_ + height_ / 2;
@@ -262,6 +287,14 @@ void BosonCamera::captureAndPublish()
     cvtColor(thermal_luma_, thermal_rgb_, COLOR_YUV2GRAY_I420, 0);
     cv_img.image = thermal_rgb_;
     cv_img.encoding = "mono8";
+  }
+
+  // --- CROP TELEMETRY FOR ROS ---
+  // Strip telemetry lines so the image matches the strict CameraInfo calibration
+  int expected_height = (sensor_type_ == Boson640) ? 512 : 256;
+  if (cv_img.image.rows > expected_height) {
+      cv::Rect crop_roi(0, 0, cv_img.image.cols, expected_height);
+      cv_img.image = cv_img.image(crop_roi);
   }
 
   auto ci = std::make_shared<sensor_msgs::msg::CameraInfo>(camera_info_->getCameraInfo());
