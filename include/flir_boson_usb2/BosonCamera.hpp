@@ -21,6 +21,7 @@
 
 #include <string>
 #include <memory>
+#include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -57,8 +58,8 @@ private:
   std::shared_ptr<camera_info_manager::CameraInfoManager> camera_info_;
   std::shared_ptr<image_transport::ImageTransport> it_;
   image_transport::CameraPublisher image_pub_;
-  rclcpp::TimerBase::SharedPtr capture_timer_;
   rclcpp::TimerBase::SharedPtr init_timer_;
+  rclcpp::TimerBase::SharedPtr capture_timer_;
 
   // Hardware variables
   int32_t width_, height_, fd_;
@@ -67,7 +68,7 @@ private:
   void* buffer_start_;
   
   // OpenCV Mats
-  cv::Mat thermal16_, thermal16_linear_, thermal16_linear_zoom_, thermal_luma_, thermal_rgb_;
+  cv::Mat thermal16_, thermal16_linear_, thermal16_linear_zoom_, thermal_luma_, thermal_gray_;
 
   // Parameters
   std::string frame_id_, dev_path_, camera_info_url_, video_mode_str_, sensor_type_str_;

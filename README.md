@@ -13,7 +13,13 @@ To use this driver, your Linux environment must have `v4l-utils` installed, and 
 Run the following commands to install dependencies and grant permissions:
 
 ```bash
-sudo apt-get install v4l-utils ros-humble-camera-info-manager ros-humble-image-transport-plugins
+# Navigate to your workspace root
+cd ~/ros2_ws 
+
+# Automatically install all dependencies (including v4l-utils and ROS packages)
+rosdep install --from-paths src --ignore-src -r -y
+
+# Grant your user access to USB Video devices
 sudo usermod -aG video $USER
 ```
 Note: You may need to log out and log back in for the group changes to take effect.
@@ -30,9 +36,11 @@ ros2 launch flir_boson_usb2 flir_boson.launch.py \
 ```
 Notes on Frame Rate and Performance:
 
-* Hardware Overrides: The frame_rate argument controls the ROS 2 software polling timer, not the physical camera hardware. If your specific FLIR Boson is factory-locked to ~9 Hz (due to export restrictions) or 60 Hz, the camera will stream at that fixed hardware rate regardless of this parameter.
+* Hardware Overrides & Polling: The `frame_rate` argument controls the ROS 2 software polling timer, not the physical camera hardware. For optimal performance, set this value equal to or slightly higher than your camera's hardware limit (e.g., 60.0). The driver utilizes an asynchronous `poll()` architecture, meaning if you poll at 60 Hz on a 9 Hz export-restricted camera, the node will safely return instantly with ~0% CPU overhead and publish perfectly at the 9 Hz hardware limit.
 
-* video_mode:=RAW16 requires significant host CPU overhead due to the sequential execution of software-based image filters. On multi-camera setups or resource-constrained environments, RAW16 processing times or USB bandwidth limits may throttle the publishing frequency down. For maximum performance and lower CPU utilization, use video_mode:=YUV.
+* Automatic Telemetry Cropping: If hardware telemetry is enabled via the FLIR GUI, the camera appends binary metadata to the bottom of the frame (changing a 640x512 image to 640x516). This driver dynamically detects the hardware layout, safely extracts the data to prevent YUV color-smearing, and strictly crops the output back to exactly 640x512 to ensure downstream ROS 2 `CameraInfo` neural networks and calibrations do not break.
+
+* RAW16 Performance: `video_mode:=RAW16` pushes raw 16-bit digital thermal counts over USB. The node applies a CPU-based software filter pipeline (Native 16-bit to 8-bit AGC, Otsu masking, Gamma=0.8, Top-Hat filter) to format the image for viewing. While the AGC array-iteration has been heavily optimized for modern processors, `video_mode:=YUV` is still recommended for resource-constrained environments (like Raspberry Pi) as it offloads contrast mapping entirely to the camera's internal DSP.
 
 ### Launch Arguments
 | Argument | Description | Default |

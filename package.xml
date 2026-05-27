@@ -16,6 +16,8 @@
   <depend>image_transport</depend>
   <depend>sensor_msgs</depend>
 
+  <exec_depend>v4l-utils</exec_depend>
+
   <export>
     <build_type>ament_cmake</build_type>
   </export>

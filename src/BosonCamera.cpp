@@ -25,7 +25,7 @@ namespace flir_boson_usb2
 using namespace cv;
 
 BosonCamera::BosonCamera(const rclcpp::NodeOptions & options)
-: Node("boson_camera", options)
+: Node("boson_camera", options), fd_(-1), buffer_start_(nullptr)
 {
   frame_id_ = this->declare_parameter("frame_id", "boson_camera");
   dev_path_ = this->declare_parameter("dev", "/dev/video0");
@@ -140,32 +140,40 @@ bool BosonCamera::openCamera()
   memset(&format, 0, sizeof(format));
   format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
+  // 1. Determine baseline sizes from parameter state
+  int requested_width = (sensor_type_ == Boson640) ? 640 : 320;
+  int requested_height = (sensor_type_ == Boson640) ? 512 : 256;
+
+  // 2. Set format parameters
   if (video_mode_ == RAW16) {
     format.fmt.pix.pixelformat = V4L2_PIX_FMT_Y16;
-    width_ = (sensor_type_ == Boson640) ? 640 : 320;
-    height_ = (sensor_type_ == Boson640) ? 512 : 256;
   } else {
     format.fmt.pix.pixelformat = V4L2_PIX_FMT_YVU420;
-    width_ = 640;
-    height_ = 512;
   }
+  format.fmt.pix.width = requested_width;
+  format.fmt.pix.height = requested_height;
 
-  format.fmt.pix.width = width_;
-  format.fmt.pix.height = height_;
-
+  // 3. Negotiate with the hardware
   if (ioctl(fd_, VIDIOC_S_FMT, &format) < 0) {
     RCLCPP_ERROR(this->get_logger(), "VIDIOC_S_FMT error. Format not supported.");
     return false;
   }
   
-  // --- ADD THIS: TELEMETRY FIX ---
-  // Overwrite hardcoded dimensions with the ACTUAL hardware dimensions.
-  // If telemetry is ON, format.fmt.pix.height will be larger (e.g. 516).
+  // 4. Validate that the hardware width matches what we requested
+  // (Prevents someone from specifying Boson_640 parameter on a physical 320 camera)
+  if (static_cast<int>(format.fmt.pix.width) != requested_width) {
+    RCLCPP_ERROR(this->get_logger(), 
+      "Hardware mismatch! Configured for %s (width %d) but V4L2 negotiated width %d.",
+      sensor_type_str_.c_str(), requested_width, format.fmt.pix.width);
+    return false;
+  }
+
+  // 5. Hard assignment: Store the TRUE negotiated hardware dimensions 
+  // (This absorbs the telemetry offset seamlessly if it is turned on)
   width_ = format.fmt.pix.width;
   height_ = format.fmt.pix.height;
-  // -------------------------------
 
-  // checking if the negotiated format matches the one requested.
+  // 6. Check that the driver accepted a format we actually know how to unpack
   if (video_mode_ == RAW16 && format.fmt.pix.pixelformat != V4L2_PIX_FMT_Y16) {
     RCLCPP_ERROR(this->get_logger(), "Driver did not negotiate Y16 in RAW16 mode.");
     return false;
@@ -173,10 +181,28 @@ bool BosonCamera::openCamera()
 
   bool is_i420 = (format.fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420);
   bool is_yv12 = (format.fmt.pix.pixelformat == V4L2_PIX_FMT_YVU420);
-
   if (video_mode_ == YUV && !is_i420 && !is_yv12) {
     RCLCPP_ERROR(this->get_logger(), "Driver did not negotiate a supported 8-bit 4:2:0 format.");
     return false;
+  }
+
+  // --- Hardware Framerate Validation ---
+  struct v4l2_streamparm streamparm;
+  memset(&streamparm, 0, sizeof(streamparm));
+  streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  
+  if (ioctl(fd_, VIDIOC_G_PARM, &streamparm) == 0) {
+    if (streamparm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME) {
+      double hw_fps = (double)streamparm.parm.capture.timeperframe.denominator /
+                      (double)streamparm.parm.capture.timeperframe.numerator;
+                      
+      if (frame_rate_ > hw_fps + 1.0) { // +1.0 for floating point margin
+        RCLCPP_WARN(this->get_logger(),
+          "Requested ROS frame_rate (%.1f Hz) exceeds actual hardware rate (%.1f Hz). "
+          "The node will automatically throttle to the hardware limit.",
+          frame_rate_, hw_fps);
+      }
+    }
   }
 
   struct v4l2_requestbuffers bufrequest;
@@ -208,19 +234,26 @@ bool BosonCamera::openCamera()
 
   memset(buffer_start_, 0, bufferinfo_.length);
 
+  // Allocate RAW16 Matrices
+  thermal16_ = Mat(height_, width_, CV_16UC1, buffer_start_, format.fmt.pix.bytesperline);
+  thermal16_linear_ = Mat(requested_height, width_, CV_8UC1);
+
+  // Allocate YUV Matrices
+  int luma_height = height_ + height_ / 2;
+  thermal_luma_ = Mat(luma_height, width_, CV_8UC1, buffer_start_);
+  thermal_gray_ = Mat(height_, width_, CV_8UC1);
+
+  // Hand the single buffer to the hardware BEFORE we start the stream
+  if (ioctl(fd_, VIDIOC_QBUF, &bufferinfo_) < 0) {
+    RCLCPP_ERROR(this->get_logger(), "Initial VIDIOC_QBUF error.");
+    return false;
+  }
+
+  // Now turn the stream on
   int type = bufferinfo_.type;
   if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
     RCLCPP_ERROR(this->get_logger(), "VIDIOC_STREAMON error.");
     return false;
-  }
-
-  if (video_mode_ == RAW16) {
-    thermal16_ = Mat(height_, width_, CV_16UC1, buffer_start_, format.fmt.pix.bytesperline);
-    thermal16_linear_ = Mat(height_, width_, CV_8U, 1);
-  } else {
-    int luma_height = height_ + height_ / 2;
-    thermal_luma_ = Mat(luma_height, width_, CV_8UC1, buffer_start_);
-    thermal_rgb_ = Mat(height_, width_, CV_8UC3, 1);
   }
 
   return true;
@@ -230,19 +263,40 @@ bool BosonCamera::closeCamera()
 {
   if (fd_ >= 0) {
     int type = bufferinfo_.type;
-    ioctl(fd_, VIDIOC_STREAMOFF, &type);
+    if (ioctl(fd_, VIDIOC_STREAMOFF, &type) < 0) {
+      RCLCPP_WARN(this->get_logger(), "Failed to stop V4L2 stream."); // Fixes Issue #7
+    }
+    
+    if (buffer_start_ != nullptr && buffer_start_ != MAP_FAILED) {
+      munmap(buffer_start_, bufferinfo_.length);
+      buffer_start_ = nullptr;
+    }
+    
     close(fd_);
+    fd_ = -1;
   }
   return true;
 }
 
 void BosonCamera::captureAndPublish()
 {
-  if (ioctl(fd_, VIDIOC_QBUF, &bufferinfo_) < 0) {
-    RCLCPP_ERROR(this->get_logger(), "VIDIOC_QBUF error.");
+  struct pollfd pfd;
+  pfd.fd = fd_;
+  pfd.events = POLLIN;
+
+  int ret = poll(&pfd, 1, 0);  // non-blocking: return immediately if no frame
+  
+  if (ret < 0) {
+    RCLCPP_ERROR(this->get_logger(), "poll() error");
     return;
   }
+  if (ret == 0) {
+    // Timeout — no frame ready this tick. 
+    // Executor is freed, hardware still working on the buffer.
+    return; 
+  }
 
+  // A frame is ready! Dequeue it instantly without blocking.
   if (ioctl(fd_, VIDIOC_DQBUF, &bufferinfo_) < 0) {
     RCLCPP_ERROR(this->get_logger(), "VIDIOC_DQBUF error.");
     return;
@@ -255,52 +309,58 @@ void BosonCamera::captureAndPublish()
   cv_bridge::CvImage cv_img;
   cv_img.header = header;
 
+  int expected_height = (sensor_type_ == Boson640) ? 512 : 256;
+
   if (video_mode_ == RAW16) {
-    agcBasicLinear(thermal16_, &thermal16_linear_, height_, width_);
+    // Process AGC ONLY on real thermal rows to prevent telemetry blowout
+    agcBasicLinear(thermal16_, &thermal16_linear_, expected_height, width_);
 
     if (!zoom_enable_) {
-      Mat mask_mat, masked_img;
-      threshold(thermal16_linear_, mask_mat, 0, 255, THRESH_BINARY | THRESH_OTSU);
-      thermal16_linear_.copyTo(masked_img, mask_mat);
+       Mat mask_mat, masked_img;
+       threshold(thermal16_linear_, mask_mat, 0, 255, THRESH_BINARY | THRESH_OTSU);
+       thermal16_linear_.copyTo(masked_img, mask_mat);
 
-      Mat d_out_img, d_norm_image, gamma_corrected_image, d_gamma_corrected_image;
-      double gamma = 0.8;
-      masked_img.convertTo(d_out_img, CV_64FC1);
-      normalize(d_out_img, d_norm_image, 0, 1, NORM_MINMAX, CV_64FC1);
-      pow(d_out_img, gamma, d_gamma_corrected_image);
-      d_gamma_corrected_image.convertTo(gamma_corrected_image, CV_8UC1);
-      normalize(gamma_corrected_image, gamma_corrected_image, 0, 255, NORM_MINMAX, CV_8UC1);
+       Mat d_out_img, d_norm_image, gamma_corrected_image, d_gamma_corrected_image;
+       double gamma = 0.8;
+       masked_img.convertTo(d_out_img, CV_64FC1);
+       normalize(d_out_img, d_norm_image, 0, 1, NORM_MINMAX, CV_64FC1);
+        
+       // Apply gamma to normalized image, then safely convert back to 8-bit mapping 0.0-1.0 to 0-255
+       pow(d_norm_image, gamma, d_gamma_corrected_image);
+       d_gamma_corrected_image.convertTo(gamma_corrected_image, CV_8UC1, 255.0);
 
-      int erosion_size = 5;
-      Mat top_hat_img, kernel = getStructuringElement(MORPH_ELLIPSE, Size(2 * erosion_size + 1, 2 * erosion_size + 1));
-      morphologyEx(gamma_corrected_image, top_hat_img, MORPH_TOPHAT, kernel);
+       int erosion_size = 5;
+       Mat top_hat_img, kernel = getStructuringElement(MORPH_ELLIPSE, Size(2 * erosion_size + 1, 2 * erosion_size + 1));
+       morphologyEx(gamma_corrected_image, top_hat_img, MORPH_TOPHAT, kernel);
 
-      cv_img.image = thermal16_linear_; // or top_hat_img if you prefer the filtered output
-      cv_img.encoding = "mono8";
-    } else {
-      Size size(640, 512);
-      resize(thermal16_linear_, thermal16_linear_zoom_, size);
-      cv_img.image = thermal16_linear_zoom_;
-      cv_img.encoding = "mono8";
-    }
-  } else {
-    cvtColor(thermal_luma_, thermal_rgb_, COLOR_YUV2GRAY_I420, 0);
-    cv_img.image = thermal_rgb_;
-    cv_img.encoding = "mono8";
-  }
+       cv_img.image = top_hat_img;
+       cv_img.encoding = "mono8";
+     } else {
+       Size size(640, 512);
+       resize(thermal16_linear_, thermal16_linear_zoom_, size);
+       cv_img.image = thermal16_linear_zoom_;
+       cv_img.encoding = "mono8";
+     }
+   } else {
+     cvtColor(thermal_luma_, thermal_gray_, COLOR_YUV2GRAY_I420, 0);
+     cv_img.image = thermal_gray_;
+     cv_img.encoding = "mono8";
+   }
 
-  // --- CROP TELEMETRY FOR ROS ---
-  // Strip telemetry lines so the image matches the strict CameraInfo calibration
-  int expected_height = (sensor_type_ == Boson640) ? 512 : 256;
-  if (cv_img.image.rows > expected_height) {
-      cv::Rect crop_roi(0, 0, cv_img.image.cols, expected_height);
-      cv_img.image = cv_img.image(crop_roi);
-  }
+   // Strip telemetry lines so the image matches the strict CameraInfo calibration
+   if (cv_img.image.rows > expected_height) {
+       cv::Rect crop_roi(0, 0, cv_img.image.cols, expected_height);
+       cv_img.image = cv_img.image(crop_roi);
+   }
 
-  auto ci = std::make_shared<sensor_msgs::msg::CameraInfo>(camera_info_->getCameraInfo());
+   auto ci = std::make_shared<sensor_msgs::msg::CameraInfo>(camera_info_->getCameraInfo());
   ci->header = header;
-
   image_pub_.publish(*cv_img.toImageMsg(), *ci);
+
+  // Hand the buffer BACK to the hardware so it can capture the next frame
+  if (ioctl(fd_, VIDIOC_QBUF, &bufferinfo_) < 0) {
+    RCLCPP_ERROR(this->get_logger(), "VIDIOC_QBUF error during recycle.");
+  }
 }
 
 }  // namespace flir_boson_usb2
