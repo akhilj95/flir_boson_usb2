@@ -41,6 +41,17 @@ BosonCamera::BosonCamera(const rclcpp::NodeOptions & options)
   sensor_type_str_ = this->declare_parameter("sensor_type", "Boson_640");
   camera_info_url_ = this->declare_parameter("camera_info_url", "");
 
+  raw16_agc_low_pct_  = this->declare_parameter("raw16_agc_low_pct", 1.0);
+  raw16_agc_high_pct_ = this->declare_parameter("raw16_agc_high_pct", 1.0);
+
+  auto clip_valid = [](double p) { return std::isfinite(p) && p >= 0.0 && p < 50.0; };
+  if (!clip_valid(raw16_agc_low_pct_) || !clip_valid(raw16_agc_high_pct_)) {
+    RCLCPP_WARN(this->get_logger(), "Invalid AGC clip percentages (%.2f / %.2f). Reverting to 1.0 / 1.0.", 
+                raw16_agc_low_pct_, raw16_agc_high_pct_);
+    raw16_agc_low_pct_ = 1.0;
+    raw16_agc_high_pct_ = 1.0;
+  }
+
   RCLCPP_INFO(this->get_logger(), "Initializing FLIR Boson on %s", dev_path_.c_str());
 
   init_timer_ = this->create_wall_timer(
@@ -54,16 +65,16 @@ BosonCamera::BosonCamera(const rclcpp::NodeOptions & options)
 void BosonCamera::init()
 {
   camera_info_ = std::make_shared<camera_info_manager::CameraInfoManager>(this);
-
-  // Set explicit Best-Effort / SensorData QoS for 60Hz high-speed video
-  rclcpp::SensorDataQoS video_qos;
+  
+  // Set explicit Best-Effort / SensorData QoS for 60Hz camera streams
   image_pub_ = image_transport::create_camera_publisher(
-  this, "image_raw", rclcpp::SensorDataQoS().get_rmw_qos_profile());
+    this, "image_raw", rclcpp::SensorDataQoS().get_rmw_qos_profile());
 
-  if (video_mode_str_ == "RAW16") video_mode_ = RAW16;
+  if (video_mode_str_ == "RAW16") video_mode_ = RAW16_PURE;
+  else if (video_mode_str_ == "RAW16_AGC") video_mode_ = RAW16_AGC;
   else if (video_mode_str_ == "YUV") video_mode_ = YUV;
   else {
-    RCLCPP_ERROR(this->get_logger(), "Invalid video_mode value provided.");
+    RCLCPP_ERROR(this->get_logger(), "Invalid video_mode. Use YUV, RAW16, or RAW16_AGC.");
     rclcpp::shutdown();
     return;
   }
@@ -80,19 +91,33 @@ void BosonCamera::init()
     return;
   }
 
-  if (camera_info_->validateURL(camera_info_url_)) {
+  if (camera_info_url_.empty()) {
+    RCLCPP_INFO(this->get_logger(),
+      "No camera_info_url set; publishing uncalibrated CameraInfo. "
+      "Set camera_info_url to a file:// or package:// URL to load a calibration.");
+  } else if (camera_info_->validateURL(camera_info_url_)) {
     camera_info_->loadCameraInfo(camera_info_url_);
+    RCLCPP_INFO(this->get_logger(),
+      "Loaded camera calibration from %s", camera_info_url_.c_str());
   } else {
-    RCLCPP_WARN(this->get_logger(), "camera_info_url could not be validated.");
+    RCLCPP_WARN(this->get_logger(),
+      "camera_info_url '%s' could not be validated; "
+      "publishing uncalibrated CameraInfo.", camera_info_url_.c_str());
   }
 
-  if (publish_color_ && video_mode_ == RAW16) {
+  if (publish_color_ && isRaw16()) {
     RCLCPP_WARN(this->get_logger(), 
-        "publish_color_ is only supported in YUV mode and will be ignored.");
+        "publish_color is only supported in YUV mode and will be ignored.");
   }
 
   if (zoom_enable_ && sensor_type_ == Boson640) {
     RCLCPP_WARN(this->get_logger(), "zoom_enable is only for Boson320.");
+  }
+
+  if (zoom_enable_ && sensor_type_ == Boson320 && video_mode_ != RAW16_AGC) {
+    RCLCPP_WARN(this->get_logger(),
+      "zoom_enable is only honored in RAW16_AGC mode (got %s). Image will be published at native sensor resolution.",
+      video_mode_str_.c_str());
   }
 
   if (!openCamera()) {
@@ -111,35 +136,49 @@ BosonCamera::~BosonCamera()
   closeCamera();
 }
 
-void BosonCamera::agcBasicLinear(const cv::Mat& input_16, cv::Mat* output_8, const int& height, const int& width)
+void BosonCamera::agc(const cv::Mat& input_16, cv::Mat& output_8, double clip_low_pct, double clip_high_pct)
 {
-    uint16_t min1 = 0xFFFF;
-    uint16_t max1 = 0x0000;
+    CV_Assert(input_16.type() == CV_16UC1);
 
-    for (int i = 0; i < height; i++) {
-        const uint16_t* row = input_16.ptr<uint16_t>(i);
-        for (int j = 0; j < width; j++) {
-            uint16_t v = row[j];
-            if (v < min1) min1 = v;
-            if (v > max1) max1 = v;
+    int histSize = 65536;
+    float range[] = { 0, 65536 };
+    const float* histRange = { range };
+    
+    // Reuses the pre-allocated hist_ member variable
+    cv::calcHist(&input_16, 1, 0, cv::Mat(), hist_, 1, &histSize, &histRange, true, false);
+
+    double total_pixels = input_16.rows * input_16.cols;
+    double clip_low_count = (clip_low_pct / 100.0) * total_pixels;
+    double clip_high_count = (clip_high_pct / 100.0) * total_pixels;
+
+    int min_val = 0, max_val = 65535;
+    double current_count = 0.0; // double prevents truncation on large sensors
+
+    // Find bottom percentile
+    for (int i = 0; i < histSize; i++) {
+        current_count += hist_.at<float>(i);
+        if (current_count > clip_low_count) {
+            min_val = i;
+            break;
         }
     }
 
-    if (max1 <= min1) {
-        output_8->setTo(0);
-        return;
-    }
-
-    for (int i = 0; i < height; i++) {
-        const uint16_t* in_row = input_16.ptr<uint16_t>(i);
-        uint8_t* out_row = output_8->ptr<uint8_t>(i);
-
-        for (int j = 0; j < width; j++) {
-            uint16_t v = in_row[j];
-            uint32_t scaled = (255u * (v - min1)) / (max1 - min1);
-            out_row[j] = static_cast<uint8_t>(scaled);
+    // Find top percentile
+    current_count = 0.0;
+    for (int i = histSize - 1; i >= 0; i--) {
+        current_count += hist_.at<float>(i);
+        if (current_count > clip_high_count) {
+            max_val = i;
+            break;
         }
     }
+
+    if (max_val <= min_val) max_val = min_val + 1; // Prevent division by zero
+
+    // Scale using SIMD-optimized convertTo
+    double scale = 255.0 / (max_val - min_val);
+    double shift = -min_val * scale;
+    input_16.convertTo(output_8, CV_8UC1, scale, shift);
 }
 
 bool BosonCamera::openCamera()
@@ -162,12 +201,12 @@ bool BosonCamera::openCamera()
   int requested_width = (sensor_type_ == Boson640) ? 640 : 320;
   int requested_height = (sensor_type_ == Boson640) ? 512 : 256;
 
-  if (zoom_enable_ && sensor_type_ == Boson320) {
+  if (zoom_enable_ && sensor_type_ == Boson320 && video_mode_ == RAW16_AGC) {
     thermal16_linear_zoom_ = Mat(512, 640, CV_8UC1);
   }
 
   // 2. Set format parameters
-  if (video_mode_ == RAW16) {
+  if (isRaw16()) {
     format.fmt.pix.pixelformat = V4L2_PIX_FMT_Y16;
   } else {
     format.fmt.pix.pixelformat = V4L2_PIX_FMT_YVU420;
@@ -208,7 +247,7 @@ bool BosonCamera::openCamera()
   }
 
   // 6. Check that the driver accepted a format we actually know how to unpack
-  if (video_mode_ == RAW16 && format.fmt.pix.pixelformat != V4L2_PIX_FMT_Y16) {
+  if (isRaw16() && format.fmt.pix.pixelformat != V4L2_PIX_FMT_Y16) {
     RCLCPP_ERROR(this->get_logger(), "Driver did not negotiate Y16 in RAW16 mode.");
     return false;
   }
@@ -241,25 +280,21 @@ bool BosonCamera::openCamera()
     }
   }
 
-  // 1. Calculate and lock the exact dimensions
+  // Calculate and lock the exact dimensions
   expected_height_ = (sensor_type_ == Boson640) ? 512 : 256;
   bytesperline_ = format.fmt.pix.bytesperline;
 
-  // 2. Request 4 buffers instead of 1
+  // Request 4 buffers to prevent pipeline stalls
   struct v4l2_requestbuffers bufrequest;
   memset(&bufrequest, 0, sizeof(bufrequest));
   bufrequest.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   bufrequest.memory = V4L2_MEMORY_MMAP;
   bufrequest.count = 4; 
 
-  if (ioctl(fd_, VIDIOC_REQBUFS, &bufrequest) < 0) {
-    RCLCPP_ERROR(this->get_logger(), "VIDIOC_REQBUFS error.");
-    return false;
-  }
+  if (ioctl(fd_, VIDIOC_REQBUFS, &bufrequest) < 0) return false;
 
   buffers_.resize(bufrequest.count);
 
-  // 3. Map all 4 buffers into memory and queue them to the hardware
   for (size_t i = 0; i < buffers_.size(); ++i) {
     struct v4l2_buffer bufferinfo;
     memset(&bufferinfo, 0, sizeof(bufferinfo));
@@ -267,38 +302,25 @@ bool BosonCamera::openCamera()
     bufferinfo.memory = V4L2_MEMORY_MMAP;
     bufferinfo.index = i;
 
-    if (ioctl(fd_, VIDIOC_QUERYBUF, &bufferinfo) < 0) {
-      RCLCPP_ERROR(this->get_logger(), "VIDIOC_QUERYBUF error.");
-      return false;
-    }
+    if (ioctl(fd_, VIDIOC_QUERYBUF, &bufferinfo) < 0) return false;
 
     buffers_[i].length = bufferinfo.length;
     buffers_[i].start = mmap(NULL, bufferinfo.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, bufferinfo.m.offset);
     
-    if (buffers_[i].start == MAP_FAILED) {
-      RCLCPP_ERROR(this->get_logger(), "mmap error.");
-      return false;
-    }
+    if (buffers_[i].start == MAP_FAILED) return false;
     memset(buffers_[i].start, 0, bufferinfo.length);
 
-    if (ioctl(fd_, VIDIOC_QBUF, &bufferinfo) < 0) {
-      RCLCPP_ERROR(this->get_logger(), "Initial VIDIOC_QBUF error.");
-      return false;
-    }
+    if (ioctl(fd_, VIDIOC_QBUF, &bufferinfo) < 0) return false;
   }
 
-  // 4. Safely allocate reusable output Mats using the locked expected_height_
-  thermal16_linear_ = Mat(expected_height_, width_, CV_8UC1);
+  // Pre-allocate output Mats to expected_height_
+  thermal16_linear_ = cv::Mat(expected_height_, width_, CV_8UC1);
   if (video_mode_ == YUV && publish_color_) {
-    thermal_rgb_ = Mat(height_, width_, CV_8UC3);
+    thermal_rgb_ = cv::Mat(height_, width_, CV_8UC3);
   }
 
-  // 5. Turn the stream on
   int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
-    RCLCPP_ERROR(this->get_logger(), "VIDIOC_STREAMON error.");
-    return false;
-  }
+  if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) return false;
 
   return true;
 }
@@ -330,26 +352,17 @@ void BosonCamera::captureAndPublish()
   struct pollfd pfd;
   pfd.fd = fd_;
   pfd.events = POLLIN;
+  if (poll(&pfd, 1, 0) <= 0) return;
 
-  int ret = poll(&pfd, 1, 0);
-  if (ret < 0) {
-      RCLCPP_ERROR(this->get_logger(), "poll() error: %s", strerror(errno));
-      return;
-  }
-  if (ret == 0) return;
-
-  // 1. Dequeue the ready buffer
   struct v4l2_buffer bufferinfo;
   memset(&bufferinfo, 0, sizeof(bufferinfo));
   bufferinfo.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   bufferinfo.memory = V4L2_MEMORY_MMAP;
-
   if (ioctl(fd_, VIDIOC_DQBUF, &bufferinfo) < 0) {
     RCLCPP_ERROR(this->get_logger(), "VIDIOC_DQBUF error.");
     return;
   }
 
-  // Get the pointer for the current buffer from our 4-buffer queue
   void* current_buffer = buffers_[bufferinfo.index].start;
 
   std_msgs::msg::Header header;
@@ -360,16 +373,22 @@ void BosonCamera::captureAndPublish()
   cv_img.header = header;
 
   // ---------- Phase A: copy data out of the V4L2 buffer ----------
-  if (video_mode_ == RAW16) {
-    Mat thermal16(height_, width_, CV_16UC1, current_buffer, bytesperline_);
-    agcBasicLinear(thermal16, &thermal16_linear_, expected_height_, width_);
-  } else {
-    Mat thermal_luma(height_ + height_ / 2, width_, CV_8UC1, current_buffer);
+  if (video_mode_ == RAW16_PURE) {
+    cv::Mat thermal16(height_, width_, CV_16UC1, current_buffer, bytesperline_);
+    cv_img.image = thermal16(cv::Rect(0, 0, width_, expected_height_)).clone();
+  }
+  else if (video_mode_ == RAW16_AGC) {
+    cv::Mat thermal16(height_, width_, CV_16UC1, current_buffer, bytesperline_);
+    cv::Mat thermal16_cropped = thermal16(cv::Rect(0, 0, width_, expected_height_));
+    agc(thermal16_cropped, thermal16_linear_, raw16_agc_low_pct_, raw16_agc_high_pct_);
+  }
+  else { // YUV
+    cv::Mat thermal_luma(height_ + height_ / 2, width_, CV_8UC1, current_buffer);
     if (publish_color_) {
-      if (is_yv12_) cvtColor(thermal_luma, thermal_rgb_, COLOR_YUV2BGR_YV12);
-      else          cvtColor(thermal_luma, thermal_rgb_, COLOR_YUV2BGR_I420);
+      if (is_yv12_) cv::cvtColor(thermal_luma, thermal_rgb_, cv::COLOR_YUV2BGR_YV12);
+      else          cv::cvtColor(thermal_luma, thermal_rgb_, cv::COLOR_YUV2BGR_I420);
     } else {
-      cv_img.image = thermal_luma(Rect(0, 0, width_, expected_height_)).clone();
+      cv_img.image = thermal_luma(cv::Rect(0, 0, width_, expected_height_)).clone();
     }
   }
 
@@ -378,39 +397,28 @@ void BosonCamera::captureAndPublish()
     RCLCPP_ERROR(this->get_logger(), "VIDIOC_QBUF error during recycle.");
   }
 
-  // ---------- Phase C: heavy processing on our own memory ----------
-  if (video_mode_ == RAW16) {
-    Mat mask_mat, masked_img;
-    threshold(thermal16_linear_, mask_mat, 0, 255, THRESH_BINARY | THRESH_OTSU);
-    thermal16_linear_.copyTo(masked_img, mask_mat);
-
-    Mat d_out_img, d_norm_image, gamma_corrected_image, d_gamma_corrected_image;
-    masked_img.convertTo(d_out_img, CV_64FC1);
-    normalize(d_out_img, d_norm_image, 0, 1, NORM_MINMAX, CV_64FC1);
-    pow(d_norm_image, 0.8, d_gamma_corrected_image);
-    d_gamma_corrected_image.convertTo(gamma_corrected_image, CV_8UC1, 255.0);
-
-    Mat top_hat_img, kernel = getStructuringElement(MORPH_ELLIPSE, Size(11, 11));
-    morphologyEx(gamma_corrected_image, top_hat_img, MORPH_TOPHAT, kernel);
-
+  // ---------- Phase C: set encodings, zoom, publish ----------
+  if (video_mode_ == RAW16_PURE) {
+    cv_img.encoding = "mono16";
+  }
+  else if (video_mode_ == RAW16_AGC) {
     if (zoom_enable_ && sensor_type_ == Boson320) {
-       resize(top_hat_img, thermal16_linear_zoom_, Size(640, 512));
-       cv_img.image = thermal16_linear_zoom_;
+      cv::resize(thermal16_linear_, thermal16_linear_zoom_, cv::Size(640, 512));
+      cv_img.image = thermal16_linear_zoom_;
     } else {
-       cv_img.image = top_hat_img;
+      cv_img.image = thermal16_linear_;
     }
     cv_img.encoding = "mono8";
-  } else {
+  }
+  else { // YUV
     if (publish_color_) {
-      cv_img.image = thermal_rgb_(Rect(0, 0, width_, expected_height_));
+      cv_img.image = thermal_rgb_(cv::Rect(0, 0, width_, expected_height_));
       cv_img.encoding = "bgr8";
     } else {
-      // cv_img.image was already populated in Phase A
-      cv_img.encoding = "mono8";
+      cv_img.encoding = "mono8"; // image already populated in Phase A
     }
   }
 
-  // 3. Publish the safe copy
   auto ci = std::make_shared<sensor_msgs::msg::CameraInfo>(camera_info_->getCameraInfo());
   ci->header = header;
   image_pub_.publish(*cv_img.toImageMsg(), *ci);

@@ -22,6 +22,7 @@
 #include <string>
 #include <cmath>
 #include <memory>
+#include <vector>
 #include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -40,7 +41,12 @@
 namespace flir_boson_usb2
 {
 
-enum Encoding { YUV = 0, RAW16 = 1 };
+enum Encoding { 
+  YUV = 0, 
+  RAW16_AGC = 1, 
+  RAW16_PURE = 2 
+};
+
 enum SensorTypes { Boson320, Boson640 };
 
 class BosonCamera : public rclcpp::Node
@@ -51,29 +57,37 @@ public:
 
 private:
   void init();
-  void agcBasicLinear(const cv::Mat& input_16, cv::Mat* output_8, const int& height, const int& width);
   bool openCamera();
   bool closeCamera();
   void captureAndPublish();
 
+  bool isRaw16() const {
+  return video_mode_ == RAW16_PURE || video_mode_ == RAW16_AGC;
+  }
+  
+  // Custom processing utilities
+  void agc(const cv::Mat& input_16, cv::Mat& output_8, double clip_low_pct, double clip_high_pct);
+
+  // ROS Node variables
   std::shared_ptr<camera_info_manager::CameraInfoManager> camera_info_;
   image_transport::CameraPublisher image_pub_;
   rclcpp::TimerBase::SharedPtr init_timer_;
   rclcpp::TimerBase::SharedPtr capture_timer_;
 
-  // Hardware variables
+  // Hardware V4L2 variables
   int32_t width_, height_, fd_;
   struct v4l2_capability cap_;
+  
   struct V4L2Buffer {
       void* start;
       size_t length;
   };
-  std::vector<V4L2Buffer> buffers_;
+  std::vector<V4L2Buffer> buffers_; // 4-buffer Ring Queue
   int expected_height_;
   size_t bytesperline_;
   
-  // OpenCV Mats
-  cv::Mat thermal16_linear_, thermal16_linear_zoom_, thermal_rgb_;
+  // OpenCV Mats (Pre-allocated to prevent memory churn)
+  cv::Mat thermal16_linear_, thermal16_linear_zoom_, thermal_rgb_, hist_;
 
   // Parameters
   std::string frame_id_, dev_path_, camera_info_url_, video_mode_str_, sensor_type_str_;
@@ -82,6 +96,8 @@ private:
   bool zoom_enable_;
   bool publish_color_;
   bool is_yv12_;
+  double raw16_agc_low_pct_;
+  double raw16_agc_high_pct_;
   SensorTypes sensor_type_;
 };
 
