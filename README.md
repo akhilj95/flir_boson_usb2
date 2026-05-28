@@ -83,7 +83,7 @@ The driver supports three `video_mode` values, each producing a different output
 | `dev` | Linux video device path (e.g. `/dev/video4`). | `/dev/video0` |
 | `frame_rate` | Polling rate for the V4L2 dequeue timer, in Hz. Any positive value is accepted; invalid values (≤ 0, NaN, inf) are clamped to 1.0 Hz with a warning. Typical hardware rates are 9, 30, or 60. | `30.0` |
 | `video_mode` | `YUV`: camera-side AGC (`mono8`/`bgr8`, low CPU). `RAW16`: raw 16-bit thermal counts (`mono16`, no host processing). `RAW16_AGC`: host-side percentile AGC (`mono8`, tunable). | `YUV` |
-| `publish_color` | If `True` and `video_mode:=YUV`, publish a `bgr8` colorized image instead of `mono8`. Ignored in `RAW16` and `RAW16_AGC` modes. | `False` |
+| `publish_color` | Publishes a `bgr8` colorized image instead of `mono8`. Use this if a color palette (e.g., Rainbow) is enabled via the FLIR GUI. Only supported in `YUV` mode; ignored in `RAW16`/`RAW16_AGC`. | `False` |
 | `raw16_agc_low_pct` | Bottom-tail clip percentage for `RAW16_AGC` (e.g. `1.0` discards the darkest 1% of pixels before linear stretch). Valid range `[0, 50)`; invalid values revert to `1.0`. | `1.0` |
 | `raw16_agc_high_pct` | Top-tail clip percentage for `RAW16_AGC` (e.g. `1.0` discards the brightest 1% of pixels before linear stretch). Valid range `[0, 50)`; invalid values revert to `1.0`. | `1.0` |
 | `zoom_enable` | Digital 2× upscale (`320×256` → `640×512`) of the published image. Only honored on `sensor_type:=Boson_320` in `RAW16_AGC` mode; ignored elsewhere. | `False` |
@@ -120,7 +120,7 @@ ros2 launch flir_boson_usb2 flir_boson.launch.py \
     camera_info_url:=file:///home/user/my_boson.yaml
 ```
 
-The `example_calibrations/` folder in this package contains placeholder YAML files — they are **examples of the format**, not valid intrinsics for any specific camera. To generate a real calibration, see the ROS 2 [`camera_calibration`](https://docs.ros.org/en/humble/p/camera_calibration/) package.
+The `example_calibrations/` folder in this package contains placeholder YAML files — they are **examples of the format**, not valid intrinsics for any specific camera. To generate a real calibration, see the ROS 2 [`camera_calibration`](https://docs.ros.org/en/jazzy/p/camera_calibration/doc/tutorial_mono.html) package.
 
 `camera_info_url` accepts both `file://` URLs (absolute path on disk) and `package://` URLs (path relative to a ROS package share directory).
 

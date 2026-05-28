@@ -79,12 +79,13 @@ void BosonCamera::init()
     return;
   }
 
+  std::string cam_name;
   if (sensor_type_str_ == "Boson_320" || sensor_type_str_ == "boson_320") {
     sensor_type_ = Boson320;
-    camera_info_->setCameraName("Boson320");
+    cam_name = "Boson320";
   } else if (sensor_type_str_ == "Boson_640" || sensor_type_str_ == "boson_640") {
     sensor_type_ = Boson640;
-    camera_info_->setCameraName("Boson640");
+    cam_name = "Boson640";
   } else {
     RCLCPP_ERROR(this->get_logger(), "Invalid sensor_type value provided.");
     rclcpp::shutdown();
@@ -92,17 +93,22 @@ void BosonCamera::init()
   }
 
   if (camera_info_url_.empty()) {
-    RCLCPP_INFO(this->get_logger(),
+    RCLCPP_WARN(this->get_logger(),
       "No camera_info_url set; publishing uncalibrated CameraInfo. "
       "Set camera_info_url to a file:// or package:// URL to load a calibration.");
-  } else if (camera_info_->validateURL(camera_info_url_)) {
-    camera_info_->loadCameraInfo(camera_info_url_);
-    RCLCPP_INFO(this->get_logger(),
-      "Loaded camera calibration from %s", camera_info_url_.c_str());
   } else {
-    RCLCPP_WARN(this->get_logger(),
-      "camera_info_url '%s' could not be validated; "
-      "publishing uncalibrated CameraInfo.", camera_info_url_.c_str());
+    // A URL was provided, so set the name and load it
+    camera_info_->setCameraName(cam_name);
+    
+    if (camera_info_->validateURL(camera_info_url_)) {
+      camera_info_->loadCameraInfo(camera_info_url_);
+      RCLCPP_INFO(this->get_logger(),
+        "Loaded camera calibration from %s", camera_info_url_.c_str());
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+        "camera_info_url '%s' could not be validated; "
+        "publishing uncalibrated CameraInfo.", camera_info_url_.c_str());
+    }
   }
 
   if (publish_color_ && isRaw16()) {
@@ -110,6 +116,12 @@ void BosonCamera::init()
         "publish_color is only supported in YUV mode and will be ignored.");
   }
 
+  if (video_mode_ != RAW16_AGC && (raw16_agc_low_pct_ != 1.0 || raw16_agc_high_pct_ != 1.0)) {
+    RCLCPP_WARN(this->get_logger(),
+        "AGC clip percentages (raw16_agc_low_pct / raw16_agc_high_pct) are only "
+        "supported in RAW16_AGC mode and will be ignored.");
+  }
+  
   if (zoom_enable_ && sensor_type_ == Boson640) {
     RCLCPP_WARN(this->get_logger(), "zoom_enable is only for Boson320.");
   }
@@ -419,7 +431,19 @@ void BosonCamera::captureAndPublish()
     }
   }
 
-  auto ci = std::make_shared<sensor_msgs::msg::CameraInfo>(camera_info_->getCameraInfo());
+  auto ci = std::make_shared<sensor_msgs::msg::CameraInfo>();
+
+  if (!camera_info_url_.empty()) {
+    // If a URL was provided, get the calibrated info from the manager
+    *ci = camera_info_->getCameraInfo();
+  } else {
+    // Otherwise, bypass the manager and populate a basic uncalibrated message
+    ci->width = width_;
+    ci->height = expected_height_;
+    ci->distortion_model = "plumb_bob";
+    // (Other arrays like D, K, R, P will remain empty/0, which is standard for uncalibrated)
+  }
+
   ci->header = header;
   image_pub_.publish(*cv_img.toImageMsg(), *ci);
 }
