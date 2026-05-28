@@ -20,6 +20,7 @@
 #define FLIR_BOSON_USB2_BOSONCAMERA_HPP
 
 #include <string>
+#include <cmath>
 #include <memory>
 #include <poll.h>
 #include <fcntl.h>
@@ -56,7 +57,6 @@ private:
   void captureAndPublish();
 
   std::shared_ptr<camera_info_manager::CameraInfoManager> camera_info_;
-  std::shared_ptr<image_transport::ImageTransport> it_;
   image_transport::CameraPublisher image_pub_;
   rclcpp::TimerBase::SharedPtr init_timer_;
   rclcpp::TimerBase::SharedPtr capture_timer_;
@@ -64,17 +64,24 @@ private:
   // Hardware variables
   int32_t width_, height_, fd_;
   struct v4l2_capability cap_;
-  struct v4l2_buffer bufferinfo_;
-  void* buffer_start_;
+  struct V4L2Buffer {
+      void* start;
+      size_t length;
+  };
+  std::vector<V4L2Buffer> buffers_;
+  int expected_height_;
+  size_t bytesperline_;
   
   // OpenCV Mats
-  cv::Mat thermal16_, thermal16_linear_, thermal16_linear_zoom_, thermal_luma_, thermal_gray_;
+  cv::Mat thermal16_linear_, thermal16_linear_zoom_, thermal_rgb_;
 
   // Parameters
   std::string frame_id_, dev_path_, camera_info_url_, video_mode_str_, sensor_type_str_;
   double frame_rate_;
   Encoding video_mode_;
   bool zoom_enable_;
+  bool publish_color_;
+  bool is_yv12_;
   SensorTypes sensor_type_;
 };
 

@@ -2,31 +2,38 @@
 
 A ROS 2 (Humble) USB camera driver for the FLIR Boson thermal camera.
 
-This package interacts with the camera using the standard Linux V4L2 (`ioctl`) interface and publishes ROS 2 image topics using OpenCV and `image_transport`.
+This package talks to the camera over the standard Linux V4L2 (`ioctl`) interface and publishes ROS 2 image topics via OpenCV and `image_transport`. The node is registered as an `rclcpp_components` composable node, so it can be loaded into a component container alongside other nodes to enable Intra-Process Communication (IPC) in multi-camera or downstream-processing pipelines.
 
-It is built utilizing ROS 2 `rclcpp_components` to allow for zero-copy memory transport (Intra-Process Communication) in complex, multi-camera environments.
+Image topics are advertised with `rclcpp::SensorDataQoS` (best-effort, KEEP_LAST=1), appropriate for high-rate video where stale frames should be dropped rather than queued.
 
 ## Prerequisites
 
-To use this driver, your Linux environment must have `v4l-utils` installed, and your user must belong to the `video` group to access the USB interfaces.
-
-Run the following commands to install dependencies and grant permissions:
+Your Linux environment needs `v4l-utils`, and your user must belong to the `video` group to access the USB interfaces.
 
 ```bash
 # Navigate to your workspace root
-cd ~/ros2_ws 
+cd ~/ros2_ws
 
-# Automatically install all dependencies (including v4l-utils and ROS packages)
+# Install all dependencies (including v4l-utils and ROS packages)
 rosdep install --from-paths src --ignore-src -r -y
 
 # Grant your user access to USB Video devices
 sudo usermod -aG video $USER
 ```
-Note: You may need to log out and log back in for the group changes to take effect.
+
+> You may need to log out and log back in for the group change to take effect.
+
+## Building
+
+```bash
+cd ~/ros2_ws
+colcon build --packages-select flir_boson_usb2 --symlink-install
+source install/setup.bash
+```
 
 ## Launching the Camera
 
-Use the provided Python launch file to start the node. You can dynamically pass arguments for your specific hardware setup:
+Use the provided Python launch file. Arguments can be overridden per-camera:
 
 ```bash
 ros2 launch flir_boson_usb2 flir_boson.launch.py \
@@ -34,39 +41,51 @@ ros2 launch flir_boson_usb2 flir_boson.launch.py \
     video_mode:=YUV \
     frame_rate:=30.0
 ```
-Notes on Frame Rate and Performance:
 
-* Hardware Overrides & Polling: The `frame_rate` argument controls the ROS 2 software polling timer, not the physical camera hardware. For optimal performance, set this value equal to or slightly higher than your camera's hardware limit (e.g., 60.0). The driver utilizes an asynchronous `poll()` architecture, meaning if you poll at 60 Hz on a 9 Hz export-restricted camera, the node will safely return instantly with ~0% CPU overhead and publish perfectly at the 9 Hz hardware limit.
+### Notes on Frame Rate and Performance
 
-* Automatic Telemetry Cropping: If hardware telemetry is enabled via the FLIR GUI, the camera appends binary metadata to the bottom of the frame (changing a 640x512 image to 640x516). This driver dynamically detects the hardware layout, safely extracts the data to prevent YUV color-smearing, and strictly crops the output back to exactly 640x512 to ensure downstream ROS 2 `CameraInfo` neural networks and calibrations do not break.
+- **Hardware rate vs. driver polling.** The `frame_rate` argument controls the ROS 2 software polling timer, not the physical camera hardware. The driver uses a non-blocking `poll()` architecture, so setting the timer above the camera's actual rate (e.g. polling at 60 Hz on a 9 Hz export-restricted camera) is safe — `poll()` returns immediately when no frame is ready, and the published rate naturally settles at the hardware limit with negligible CPU overhead.
 
-* RAW16 Performance: `video_mode:=RAW16` pushes raw 16-bit digital thermal counts over USB. The node applies a CPU-based software filter pipeline (Native 16-bit to 8-bit AGC, Otsu masking, Gamma=0.8, Top-Hat filter) to format the image for viewing. While the AGC array-iteration has been heavily optimized for modern processors, `video_mode:=YUV` is still recommended for resource-constrained environments (like Raspberry Pi) as it offloads contrast mapping entirely to the camera's internal DSP.
+- **Automatic telemetry handling.** When hardware telemetry is enabled via the FLIR GUI, the camera appends one or more rows of binary metadata to the bottom of the frame. The driver negotiates the actual buffer dimensions with V4L2, processes the full buffer for YUV unpacking, and then crops the published image back to the nominal sensor size (640×512 or 320×256) so that calibration files and downstream nodes consuming `CameraInfo` continue to work unchanged.
+
+- **RAW16 vs YUV.** `video_mode:=RAW16` pushes raw 16-bit digital thermal counts over USB and runs a CPU-side pipeline (linear AGC → Otsu masking → gamma 0.8 → top-hat) to produce a viewable 8-bit image. `video_mode:=YUV` offloads contrast mapping to the camera's internal DSP and is recommended for resource-constrained hosts such as a Raspberry Pi.
 
 ### Launch Arguments
+
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `namespace` | The ROS namespace for the camera nodes. | `flir_boson` |
-| `frame_id` | The TF frame ID for the camera. | `boson_camera` |
-| `dev` | The Linux file descriptor location for the camera (e.g., `/dev/video4`). | `/dev/video0` |
-| `frame_rate` | Target polling rate for the V4L2 USB bus. Valid values are `30.0` or `60.0`. | `30.0` |
-| `video_mode` | The hardware output mode of the camera.<br><br>**`YUV`:** Offloads AGC and contrast mapping to the camera's internal hardware DSP. Output is a clean, low-CPU overhead stream.<br>**`RAW16`:** Pushes raw 16-bit digital thermal counts over USB. The node applies a heavy CPU-based software filter pipeline (Otsu masking, Gamma=0.8, Top-Hat filter) to format the image for viewing. | `YUV` |
-| `zoom_enable` | Digital zoom flag. Valid values are `True` or `False`. | `False` |
-| `sensor_type` | The size of your physical sensor array. Options are `Boson_320` or `Boson_640`. | `Boson_640` |
-| `camera_info_url` | Location of the camera calibration file. | `file://<package_dir>/example_calibrations/Boson640.yaml` |
+| `namespace` | ROS namespace for the camera node. | `flir_boson` |
+| `frame_id` | TF frame ID stamped on each `Image` header. | `boson_camera` |
+| `dev` | Linux video device path (e.g. `/dev/video4`). | `/dev/video0` |
+| `frame_rate` | Polling rate for the V4L2 dequeue timer, in Hz. Any positive value is accepted; invalid values (≤ 0, NaN, inf) are clamped to 1.0 Hz with a warning. Typical hardware rates are 9, 30, or 60. | `30.0` |
+| `video_mode` | `YUV` — camera-side AGC, low CPU. `RAW16` — host-side AGC pipeline (Otsu masking, gamma, top-hat), more CPU but more control. | `YUV` |
+| `publish_color` | If `True` and `video_mode:=YUV`, publish a `bgr8` colorized image instead of `mono8`. Ignored in `RAW16` mode. | `False` |
+| `zoom_enable` | Digital 2× upscale (`320×256` → `640×512`). Only meaningful for `sensor_type:=Boson_320` in `RAW16` mode. | `False` |
+| `sensor_type` | Physical sensor array size. `Boson_320` or `Boson_640`. | `Boson_640` |
+| `camera_info_url` | URL of the camera calibration YAML file (e.g. `file://path/to/Boson640.yaml`). Empty disables loading. | `""` |
 
 ## Published Topics
-* `/flir_boson/image_raw (sensor_msgs/msg/Image)`
- The primary video stream, published as an 8-bit grayscale (mono8) image.
 
-* `/flir_boson/camera_info (sensor_msgs/msg/CameraInfo)`
- Camera calibration matrices and metadata.
+- **`/<namespace>/image_raw`** (`sensor_msgs/msg/Image`)
+  The primary video stream. Encoding is `mono8` by default, or `bgr8` when `publish_color:=True` in YUV mode.
+
+- **`/<namespace>/camera_info`** (`sensor_msgs/msg/CameraInfo`)
+  Calibration matrices and metadata, populated from `camera_info_url` if provided.
+
+Both topics are advertised with `rclcpp::SensorDataQoS` (best-effort).
+
+## Troubleshooting
+
+- **`ERROR: Invalid Video Device`** — Check `ls /dev/video*` and confirm your user is in the `video` group (`groups` should list it). A logout/login is required after `usermod`.
+- **`VIDIOC_S_FMT error. Format not supported`** — The Boson typically exposes two `/dev/videoN` nodes (one for YUV, one for Y16). Try the next index, or check that your `video_mode` matches what that node provides.
+- **`Hardware mismatch! Configured for Boson_640 but V4L2 negotiated width 320`** — Wrong `sensor_type` for the physical camera. Set it to match the actual sensor.
+- **`Driver reports YUV bytesperline=X but width=Y`** — The driver is reporting strided YUV buffers, which this node does not currently handle. File an issue with the output of `v4l2-ctl -d <dev> --get-fmt-video` attached.
 
 ## Credits & Lineage
 
 This ROS 2 package is a direct descendant and port of two open-source projects. Immense credit goes to the original authors:
 
-1. **[FLIR Systems / BosonUSB](https://github.com/FLIR/BosonUSB)**: The foundational V4L2 C++ interactions and 16-bit to 8-bit AGC conversions were developed directly by FLIR Systems.
+1. **[FLIR Systems / BosonUSB](https://github.com/FLIR/BosonUSB)** — Foundational V4L2 C++ interactions and 16-bit to 8-bit AGC conversions.
+2. **[AutonomouStuff / flir_boson_usb](https://github.com/astuff/flir_boson_usb)** — Original ROS 1 wrapper, nodelet architecture, and RAW16 image processing filters.
 
-2. **[AutonomouStuff / flir_boson_usb](https://github.com/astuff/flir_boson_usb)**: The original ROS 1 wrapper, nodelet architecture, and advanced RAW16 image processing filters were developed by the AutonomouStuff Software Development Team.
-
-Both original codebases and this ROS 2 port are provided under the MIT License.
+Both original codebases and this ROS 2 port are released under the MIT License.

@@ -35,6 +35,10 @@ def generate_launch_description():
         'zoom_enable', default_value='False',
         description='Valid values are True or False'
     )
+    publish_color_arg = DeclareLaunchArgument(
+        'publish_color', default_value='False',
+        description='Extract and publish 3-channel BGR palettes instead of mono8 (YUV mode only)'
+    )
     sensor_type_arg = DeclareLaunchArgument(
         'sensor_type', default_value='Boson_640',
         description='Valid values are Boson_320 or Boson_640'
@@ -57,6 +61,7 @@ def generate_launch_description():
             'frame_rate': LaunchConfiguration('frame_rate'),
             'video_mode': LaunchConfiguration('video_mode'),
             'zoom_enable': LaunchConfiguration('zoom_enable'),
+            'publish_color': LaunchConfiguration('publish_color'),
             'sensor_type': LaunchConfiguration('sensor_type'),
             'camera_info_url': LaunchConfiguration('camera_info_url')
         }]
@@ -69,6 +74,7 @@ def generate_launch_description():
         frame_rate_arg,
         video_mode_arg,
         zoom_enable_arg,
+        publish_color_arg,
         sensor_type_arg,
         camera_info_url_arg,
         boson_camera_node
