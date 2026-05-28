@@ -1,14 +1,12 @@
 # FLIR Boson USB ROS 2 Driver (`flir_boson_usb2`)
 
-A ROS 2 (Humble) USB camera driver for the FLIR Boson thermal camera.
+A ROS 2 (Humble) USB camera driver for the FLIR Boson thermal camera utilizing V4L2 and OpenCV.
 
-This package talks to the camera over the standard Linux V4L2 (`ioctl`) interface and publishes ROS 2 image topics via OpenCV and `image_transport`. The node is registered as an `rclcpp_components` composable node, so it can be loaded into a component container alongside other nodes to enable Intra-Process Communication (IPC) in multi-camera or downstream-processing pipelines.
-
-Image topics are advertised with `rclcpp::SensorDataQoS` (best-effort, `KEEP_LAST` with shallow depth), appropriate for high-rate video where stale frames should be dropped rather than queued.
+The node is written as an `rclcpp_components` composable node to enable Intra-Process Communication (IPC) pipelines. Topics are advertised using `rclcpp::SensorDataQoS` (best-effort, shallow depth) to optimize high-rate video delivery by dropping stale frames.
 
 ## Prerequisites
 
-Your Linux environment needs `v4l-utils`, and your user must belong to the `video` group to access the USB interfaces.
+Your user must belong to the `video` group to access USB video devices.
 
 ```bash
 # Navigate to your workspace root
@@ -30,14 +28,10 @@ cd ~/ros2_ws
 colcon build --packages-select flir_boson_usb2 --symlink-install
 source install/setup.bash
 ```
-## Checking the Camera
-Verify if the system detects the device
+## Device Verification
+Verify that the system detects the UVC-compliant FLIR Boson hardware:
 ```bash
 lsusb | grep FLIR
-```
-
-Many Boson models support UVC, so they work like webcam
-```bash
 v4l2-ctl --list-devices
 ```
 It should return something like the following:
@@ -58,21 +52,21 @@ ros2 launch flir_boson_usb2 flir_boson.launch.py \
     frame_rate:=30.0
 ```
 
-### The three video modes
+### Video modes
 
 The driver supports three `video_mode` values, each producing a different output stream:
 
-- **`YUV`** (default) — The camera's internal DSP does AGC and produces a contrast-mapped 8-bit image. Published as `mono8`, or `bgr8` when `publish_color:=True`. Lowest host CPU cost, recommended for resource-constrained hosts such as a Raspberry Pi.
+- **`YUV`** (default) — Camera-side DSP handles Automatic Gain Control (AGC) for a contrast-mapped 8-bit image (`mono8` or `bgr8` when `publish_color:=True`). Lowest CPU footprint, ideal for single-board computers or multi camera setup.
 
-- **`RAW16`** — Raw 16-bit thermal counts from the bolometer array, published unchanged as `mono16`. No host-side processing. This is the mode to use for radiometric work, custom AGC, ML on raw thermal features, or anything else that needs the actual sensor values. RViz can display `mono16` directly (it auto-stretches).
+- **`RAW16`** — Direct 16-bit bolometer thermal counts (`mono16`). No host processing; ideal for radiometric work or custom feature detection. Some packages might not accept `mono16` directly so be mindful of that.
 
-- **`RAW16_AGC`** — Same source as `RAW16`, but the driver applies a host-side percentile-clipping AGC and publishes the result as `mono8`. Tunable via `raw16_agc_low_pct` / `raw16_agc_high_pct`. More robust to outlier pixels and isolated hot spots than the camera-internal AGC, at the cost of CPU time per frame.
+- **`RAW16_AGC`** —Direct 16-bit source with host-side percentile-clipping AGC mapped to `mono8`. Tunable via `raw16_agc_low_pct` / `raw16_agc_high_pct`. More robust to outlier pixels and isolated hot spots than the camera-internal AGC, at the cost of CPU time per frame.
 
 ### Notes on frame rate and performance
 
-- **Hardware rate vs. driver polling.** The `frame_rate` argument controls the ROS 2 software polling timer, not the physical camera hardware. The driver uses a non-blocking `poll()` architecture, so setting the timer above the camera's actual rate (e.g. polling at 60 Hz on a 9 Hz export-restricted camera) is safe — `poll()` returns immediately when no frame is ready, and the published rate naturally settles at the hardware limit with negligible CPU overhead.
+- **Hardware rate vs. driver polling.** The `frame_rate` argument controls the software polling loop via a non-blocking poll() architecture. Setting it above hardware limits (e.g., polling at 60Hz on a 9Hz camera) safely drops back to the physical rate with no CPU penalty.
 
-- **Automatic telemetry handling.** When hardware telemetry is enabled via the FLIR GUI, the camera appends one or more rows of binary metadata to the bottom of the frame. The driver negotiates the actual buffer dimensions with V4L2, processes the full buffer for unpacking, and then crops the published image back to the nominal sensor size (640×512 or 320×256) so calibration files and downstream nodes consuming `CameraInfo` continue to work unchanged. In `RAW16_AGC` mode, telemetry rows are also excluded from the histogram used for AGC, so they cannot skew contrast.
+- **Automatic telemetry handling.** If binary telemetry metadata rows are active via the FLIR GUI, the driver reads the full buffer, handles telemetry isolation, and automatically crops the published image back to nominal array sizes (640×512 or 320×256) so standard `CameraInfo` calibrations continue to function perfectly.
 
 ### Launch arguments
 
@@ -81,7 +75,7 @@ The driver supports three `video_mode` values, each producing a different output
 | `namespace` | ROS namespace for the camera node. | `flir_boson` |
 | `frame_id` | TF frame ID stamped on each `Image` header. | `boson_camera` |
 | `dev` | Linux video device path (e.g. `/dev/video4`). | `/dev/video0` |
-| `frame_rate` | Polling rate for the V4L2 dequeue timer, in Hz. Any positive value is accepted; invalid values (≤ 0, NaN, inf) are clamped to 1.0 Hz with a warning. Typical hardware rates are 9, 30, or 60. | `30.0` |
+| `frame_rate` | V4L2 dequeue timer rate in Hz. Settles to physical limit if parameter exceeds hardware rate. Typical hardware rates are 9, 30, or 60. | `30.0` |
 | `video_mode` | `YUV`: camera-side AGC (`mono8`/`bgr8`, low CPU). `RAW16`: raw 16-bit thermal counts (`mono16`, no host processing). `RAW16_AGC`: host-side percentile AGC (`mono8`, tunable). | `YUV` |
 | `publish_color` | Publishes a `bgr8` colorized image instead of `mono8`. Use this if a color palette (e.g., Rainbow) is enabled via the FLIR GUI. Only supported in `YUV` mode; ignored in `RAW16`/`RAW16_AGC`. | `False` |
 | `raw16_agc_low_pct` | Bottom-tail clip percentage for `RAW16_AGC` (e.g. `1.0` discards the darkest 1% of pixels before linear stretch). Valid range `[0, 50)`; invalid values revert to `1.0`. | `1.0` |
@@ -120,21 +114,17 @@ ros2 launch flir_boson_usb2 flir_boson.launch.py \
     camera_info_url:=file:///home/user/my_boson.yaml
 ```
 
-The `example_calibrations/` folder in this package contains placeholder YAML files — they are **examples of the format**, not valid intrinsics for any specific camera. To generate a real calibration, see the ROS 2 [`camera_calibration`](https://docs.ros.org/en/jazzy/p/camera_calibration/doc/tutorial_mono.html) package.
+Note: Files inside `example_calibrations/` act purely as format reference models. To create target matrices for your physical lens setup, use the ROS 2 [`camera_calibration`](https://docs.ros.org/en/jazzy/p/camera_calibration/doc/tutorial_mono.html) tools.
 
 `camera_info_url` accepts both `file://` URLs (absolute path on disk) and `package://` URLs (path relative to a ROS package share directory).
 
 ## Customizing the RAW16 pipeline
 
-For users who want to apply their own filters, AGC curves, or feature detection on raw thermal counts, the `RAW16_AGC` branch in `BosonCamera::captureAndPublish()` is the place to start. It receives the cropped raw 16-bit buffer as a `cv::Mat` and runs `agc()` for percentile-clipping AGC. Replace or extend `agc()` with your own processing — anything from histogram equalization to top-hat filtering for hot-spot detection to neural-network inference — and the rest of the pipeline (zoom, publish, calibration metadata) keeps working unchanged.
-
-If you'd rather not edit the driver, subscribe to a `RAW16` (`mono16`) stream from your own node and do the processing out-of-process. The `mono16` stream is the full 16-bit precision exactly as the sensor reports it.
+To implement custom radiometric filters, lookup tables, or neural network inference arrays directly on raw thermal data, hook into the `RAW16_AGC` execution path inside `BosonCamera::captureAndPublish()` where the uncompressed raw 16-bit `cv::Mat` is passed to the `agc()` processing loop. Alternatively, capture the unprocessed `RAW16` (`mono16`) topic stream externally within an independent node.
 
 ## Troubleshooting
 
-- **`ERROR: Invalid Video Device`** — Check `ls /dev/video*` and confirm your user is in the `video` group (`groups` should list it). A logout/login is required after `usermod`.
-
-- **`VIDIOC_S_FMT error. Format not supported`** — The Boson typically exposes two `/dev/videoN` nodes (one for YUV, one for Y16). Try the next index, or confirm that the `video_mode` you requested matches what that node provides.
+- **`ERROR: Invalid Video Device`** — Verify user permissions in the `video` group (`groups` should list it). Ensure correct hardware links via `ls /dev/video*`.
 
 - **`Hardware mismatch! Configured for Boson_640 but V4L2 negotiated width 320`** — Wrong `sensor_type` for the physical camera. Set it to match the actual sensor.
 
